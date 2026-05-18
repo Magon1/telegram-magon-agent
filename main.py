@@ -52,8 +52,53 @@ pc = Pinecone(api_key=PINECONE_API_KEY) if PINECONE_API_KEY else None
 pinecone_index = pc.Index(PINECONE_INDEX_NAME) if pc else None
 voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY) if VOYAGE_API_KEY else None
 
-# 이미 인덱싱한 파일 추적 (메모리 - 재배포되면 초기화됨)
+# 이미 인덱싱한 파일 추적 (메모리)
 indexed_files_cache = set()
+
+
+# ==================== 모델 라우터 ====================
+
+def select_model(user_message: str) -> str:
+    """질문 내용에 따라 적절한 Claude 모델 선택"""
+    
+    msg = user_message.lower().strip()
+    
+    # 명시적 모델 지정 (최우선)
+    if any(msg.startswith(prefix) for prefix in ("/opus", "/think", "/deep", "/깊게")):
+        return "claude-opus-4-7"
+    if any(msg.startswith(prefix) for prefix in ("/sonnet", "/balanced")):
+        return "claude-sonnet-4-6"
+    if any(msg.startswith(prefix) for prefix in ("/haiku", "/quick", "/fast", "/빠르게")):
+        return "claude-haiku-4-5-20251001"
+    
+    # Sonnet 트리거 키워드 (전략/분석/기획)
+    sonnet_keywords = [
+        # 전략·기획
+        "전략", "기획", "방향성", "로드맵", "방안", "대안",
+        # 분석·검토
+        "분석", "검토", "비교", "장단점", "리스크", "전망", "예측",
+        # 의사결정
+        "어떻게 생각", "조언", "추천", "솔직하게", "의견", "판단",
+        "어떡하지", "어떻게 해야", "고민",
+        # 작성·정리
+        "초안", "보고서", "제안서", "정리해",
+        # 비즈니스
+        "bm", "비즈니스 모델", "ir", "투자", "vc", "딜", "deal",
+        "valuation", "밸류에이션",
+        # 사고력 요구
+        "왜", "이유", "근거"
+    ]
+    
+    for kw in sonnet_keywords:
+        if kw in msg:
+            return "claude-sonnet-4-6"
+    
+    # 긴 질문은 보통 복잡함
+    if len(user_message) > 200:
+        return "claude-sonnet-4-6"
+    
+    # 기본: Haiku (빠르고 저렴)
+    return "claude-haiku-4-5-20251001"
 
 
 # ==================== 텍스트 추출 ====================
@@ -207,7 +252,22 @@ def list_indexed_documents() -> dict:
     return {"total_chunks": stats.get("total_vector_count", 0)}
 
 
-# ==================== Google Drive 자동 동기화 ====================
+# ==================== Google Calendar / Drive ====================
+
+def get_google_credentials():
+    if not GOOGLE_REFRESH_TOKEN:
+        return None
+    creds = Credentials(
+        token=None,
+        refresh_token=GOOGLE_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=GOOGLE_SCOPES,
+    )
+    creds.refresh(GoogleRequest())
+    return creds
+
 
 def get_drive_service():
     creds = get_google_credentials()
@@ -225,7 +285,6 @@ async def sync_drive_folder():
     if not service:
         return {"error": "Drive 인증 안 됨"}
     
-    # 폴더 내 파일 목록
     query = f"'{GOOGLE_DRIVE_KB_FOLDER_ID}' in parents and trashed=false"
     results = service.files().list(
         q=query,
@@ -242,19 +301,16 @@ async def sync_drive_folder():
         file_id = f['id']
         filename = f['name']
         
-        # 이미 처리한 파일은 스킵
         cache_key = f"drive::{file_id}::{f.get('modifiedTime', '')}"
         if cache_key in indexed_files_cache:
             skipped.append(filename)
             continue
         
-        # 지원하는 확장자만
         if not filename.lower().endswith(('.pdf', '.pptx', '.docx', '.txt', '.md')):
             skipped.append(f"{filename} (지원 안 함)")
             continue
         
         try:
-            # 다운로드
             request = service.files().get_media(fileId=file_id)
             file_bytes = io.BytesIO()
             downloader = MediaIoBaseDownload(file_bytes, request)
@@ -262,7 +318,6 @@ async def sync_drive_folder():
             while not done:
                 _, done = downloader.next_chunk()
             
-            # 인덱싱
             result = await index_document(filename, file_bytes.getvalue(), source="drive")
             if result.get("success"):
                 indexed.append(f"{filename} ({result['pages']}p, {result['chunks']}c)")
@@ -277,57 +332,8 @@ async def sync_drive_folder():
         "skipped_count": len(skipped),
         "failed_count": len(failed),
         "indexed": indexed,
-        "failed": failed[:5]  # 처음 5개만
+        "failed": failed[:5]
     }
-
-
-# ==================== Slack 파일 처리 ====================
-
-async def index_slack_file(file_id: str) -> dict:
-    """슬랙 파일을 받아서 인덱싱"""
-    if not SLACK_TOKEN:
-        return {"error": "Slack 토큰 없음"}
-    
-    # 파일 정보 조회
-    file_info = await slack_api_call("files.info", {"file": file_id})
-    if not file_info.get("ok"):
-        return {"error": f"파일 정보 조회 실패: {file_info.get('error')}"}
-    
-    file_data = file_info["file"]
-    filename = file_data.get("name", "unknown")
-    download_url = file_data.get("url_private_download") or file_data.get("url_private")
-    
-    if not download_url:
-        return {"error": "다운로드 URL 없음"}
-    
-    # 다운로드 (Bearer 토큰 필요)
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.get(
-            download_url,
-            headers={"Authorization": f"Bearer {SLACK_TOKEN}"}
-        )
-        if resp.status_code != 200:
-            return {"error": f"다운로드 실패: HTTP {resp.status_code}"}
-        file_bytes = resp.content
-    
-    return await index_document(filename, file_bytes, source="slack")
-
-
-# ==================== Google Calendar ====================
-
-def get_google_credentials():
-    if not GOOGLE_REFRESH_TOKEN:
-        return None
-    creds = Credentials(
-        token=None,
-        refresh_token=GOOGLE_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=GOOGLE_SCOPES,
-    )
-    creds.refresh(GoogleRequest())
-    return creds
 
 
 def list_calendars():
@@ -389,6 +395,25 @@ async def slack_api_call(method: str, payload: dict = None):
         else:
             response = await client.post(url, headers=headers, json=payload)
         return response.json()
+
+
+async def index_slack_file(file_id: str) -> dict:
+    if not SLACK_TOKEN:
+        return {"error": "Slack 토큰 없음"}
+    file_info = await slack_api_call("files.info", {"file": file_id})
+    if not file_info.get("ok"):
+        return {"error": f"파일 정보 조회 실패: {file_info.get('error')}"}
+    file_data = file_info["file"]
+    filename = file_data.get("name", "unknown")
+    download_url = file_data.get("url_private_download") or file_data.get("url_private")
+    if not download_url:
+        return {"error": "다운로드 URL 없음"}
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.get(download_url, headers={"Authorization": f"Bearer {SLACK_TOKEN}"})
+        if resp.status_code != 200:
+            return {"error": f"다운로드 실패: HTTP {resp.status_code}"}
+        file_bytes = resp.content
+    return await index_document(filename, file_bytes, source="slack")
 
 
 async def search_slack_channel(channel_name_or_keyword: str, limit: int = 30):
@@ -458,7 +483,7 @@ CLAUDE_TOOLS = [
     },
     {
         "name": "sync_drive_folder",
-        "description": "Google Drive의 Knowledge Base 폴더를 스캔해서 새 문서 자동 인덱싱. 사장님이 '드라이브 동기화', '새 자료 업데이트' 요청 시 사용.",
+        "description": "Google Drive의 Knowledge Base 폴더를 스캔해서 새 문서 자동 인덱싱.",
         "input_schema": {"type": "object", "properties": {}}
     },
     {
@@ -588,6 +613,7 @@ SYSTEM_PROMPT = f"""당신은 ReboundX 대표 magon님의 개인 비서 AI입니
 - "드라이브 동기화", "새 자료 가져와" → sync_drive_folder
 - 팀원 일정 → list_calendars로 누가 공유했나 확인 후 get_calendar_events
 - 슬랙 메시지 발송은 명시적 요청 시만
+- 간단한 인사·잡담은 도구 호출 없이 바로 답변
 
 스타일: 한국어, 존댓말, 간결, 정확. 모르면 모른다고.
 """
@@ -596,10 +622,14 @@ SYSTEM_PROMPT = f"""당신은 ReboundX 대표 magon님의 개인 비서 AI입니
 async def get_claude_response(user_message: str) -> str:
     conversation_history.append({"role": "user", "content": user_message})
     
+    # 모델 선택
+    model = select_model(user_message)
+    print(f"[model] {model} for: {user_message[:50]}")
+    
     for _ in range(10):
         try:
             response = await claude.messages.create(
-                model="claude-sonnet-4-5",
+                model=model,
                 max_tokens=4096,
                 system=SYSTEM_PROMPT,
                 tools=CLAUDE_TOOLS,
@@ -648,15 +678,10 @@ async def download_telegram_file(file_id: str) -> tuple:
             params={"file_id": file_id}
         )
         info_json = info.json()
-        
         if not info_json.get("ok"):
             raise Exception(f"파일 정보 조회 실패: {info_json}")
-        
         file_path = info_json["result"]["file_path"]
-        
-        resp = await client.get(
-            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-        )
+        resp = await client.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}")
         resp.raise_for_status()
         return file_path.split("/")[-1], resp.content
 
@@ -681,7 +706,7 @@ async def telegram_webhook(request: Request):
         file_size_mb = doc.get("file_size", 0) / 1024 / 1024
         
         if file_size_mb > 20:
-            await send_telegram_message(chat_id, 
+            await send_telegram_message(chat_id,
                 f"⚠️ *{filename}* ({file_size_mb:.1f}MB) 텔레그램 한계 20MB 초과\n"
                 f"💡 Google Drive 'Knowledge Base' 폴더에 업로드 후 \"드라이브 동기화\" 보내주세요")
             return {"ok": True}
@@ -691,7 +716,6 @@ async def telegram_webhook(request: Request):
         try:
             _, file_bytes = await download_telegram_file(file_id)
             result = await index_document(filename, file_bytes, source="telegram")
-            
             if result.get("success"):
                 await send_telegram_message(chat_id,
                     f"✅ *{filename}* 인덱싱 완료\n"
@@ -715,12 +739,9 @@ async def telegram_webhook(request: Request):
         if result.get("error"):
             await send_telegram_message(chat_id, f"❌ {result['error']}")
         else:
-            msg = f"✅ 동기화 완료\n"
-            msg += f"📥 신규 인덱싱: {result['indexed_count']}개\n"
-            msg += f"⏭ 스킵: {result['skipped_count']}개\n"
-            msg += f"❌ 실패: {result['failed_count']}개"
+            msg = f"✅ 동기화 완료\n📥 신규: {result['indexed_count']}개\n⏭ 스킵: {result['skipped_count']}개\n❌ 실패: {result['failed_count']}개"
             if result['indexed']:
-                msg += "\n\n*신규:*\n" + "\n".join(f"• {n}" for n in result['indexed'][:10])
+                msg += "\n\n*신규 인덱싱:*\n" + "\n".join(f"• {n}" for n in result['indexed'][:10])
             await send_telegram_message(chat_id, msg)
         return {"ok": True}
     
@@ -729,11 +750,14 @@ async def telegram_webhook(request: Request):
             "*기능*\n"
             "📅 캘린더 조회/추가\n"
             "💬 슬랙 조회/발송\n"
-            "📚 문서 업로드 (20MB까지 텔레그램, 더 크면 Drive)\n"
-            "🔍 문서 검색\n\n"
-            "*명령어*\n"
+            "📚 문서 업로드 + RAG 검색\n\n"
+            "*모델 명령어*\n"
+            "/think - Opus (깊은 사고)\n"
+            "/sonnet - Sonnet (균형)\n"
+            "/quick - Haiku (빠름)\n\n"
+            "*기타*\n"
             "/reset - 대화 초기화\n"
-            "/sync - Drive 폴더 동기화\n"
+            "/sync - Drive 동기화\n"
             "/auth - Google 인증\n"
             "/help - 도움말")
         return {"ok": True}
@@ -742,34 +766,33 @@ async def telegram_webhook(request: Request):
         await send_telegram_message(chat_id, f"https://{RAILWAY_URL}/auth/google")
         return {"ok": True}
     
+    # 모델 선택 + 즉시 응답
+    model_to_use = select_model(text)
+    if "opus" in model_to_use:
+        await send_telegram_message(chat_id, "🧠 깊게 생각 중... (조금 더 걸려요)")
+    elif "sonnet" in model_to_use:
+        await send_telegram_message(chat_id, "💭 분석 중...")
+    else:
+        await send_telegram_message(chat_id, "⚡ 처리 중...")
+    
     reply = await get_claude_response(text)
     await send_telegram_message(chat_id, reply)
     return {"ok": True}
 
 
-# ==================== Slack 이벤트 (파일 자동 인덱싱) ====================
+# ==================== Slack 이벤트 ====================
 
 @app.post("/slack/events")
 async def slack_events(request: Request):
-    """Slack에 PDF/PPT 업로드 감지 → 자동 인덱싱"""
     data = await request.json()
-    
-    # URL 검증
     if data.get("type") == "url_verification":
         return {"challenge": data.get("challenge")}
-    
     event = data.get("event", {})
-    
-    # 파일 공유 이벤트
     if event.get("type") == "file_shared":
         file_id = event.get("file_id") or event.get("file", {}).get("id")
         if file_id:
             result = await index_slack_file(file_id)
-            if result.get("success"):
-                print(f"[slack file] indexed {result['filename']}")
-            else:
-                print(f"[slack file] failed: {result.get('error')}")
-    
+            print(f"[slack file] {result}")
     return {"ok": True}
 
 
@@ -812,7 +835,7 @@ def auth_google_callback(code: str):
     return HTMLResponse(f"""
     <html><body style="font-family:sans-serif;padding:40px">
     <h1>✅ 인증 성공</h1>
-    <p>Drive 권한도 새로 받았으니 <b>GOOGLE_REFRESH_TOKEN</b>을 아래 값으로 <b>업데이트</b>하세요:</p>
+    <p>Railway에 <b>GOOGLE_REFRESH_TOKEN</b> 업데이트:</p>
     <pre style="background:#f0f0f0;padding:20px;border-radius:8px;word-break:break-all">{refresh_token}</pre>
     </body></html>
     """)

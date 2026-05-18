@@ -4,8 +4,8 @@ import httpx
 
 app = FastAPI()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-AUTHORIZED_CHAT_ID = int(os.getenv("AUTHORIZED_CHAT_ID", "0"))
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+AUTHORIZED_CHAT_ID = int((os.getenv("AUTHORIZED_CHAT_ID") or "0").strip())
 
 
 async def send_telegram_message(chat_id: int, text: str):

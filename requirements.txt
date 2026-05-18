@@ -5,3 +5,9 @@ anthropic
 google-auth
 google-auth-oauthlib
 google-api-python-client
+pinecone
+voyageai
+pypdf
+python-pptx
+python-docx
+python-multipart

@@ -23,7 +23,7 @@ SYSTEM_PROMPT = """당신은 ReboundX 대표(magon)의 개인 비서 AI입니다
 
 회사 컨텍스트:
 - 회사: ReboundX
-- 제품: ReboundX (리베이트), Terminal (베타 출시 준비 중), Lux
+- 제품: ReboundX (리베이트), Terminal (베타 출시 준비 중, 22일 이후 MVP런칭),
 - 주요 인물: 정예진, 이승원, 권은서(althea), magon
 
 대화 스타일:

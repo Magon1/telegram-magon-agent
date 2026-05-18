@@ -3,7 +3,7 @@ import re
 import json
 from datetime import datetime
 from collections import deque
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse, HTMLResponse
 import httpx
 from anthropic import AsyncAnthropic
@@ -14,7 +14,8 @@ from google.auth.transport.requests import Request as GoogleRequest
 
 app = FastAPI()
 
-# 환경변수 정리
+# ==================== 환경변수 ====================
+
 _clean = lambda s: re.sub(r'\s+', '', s or '')
 TELEGRAM_BOT_TOKEN = _clean(os.getenv("TELEGRAM_BOT_TOKEN"))
 AUTHORIZED_CHAT_ID = int(_clean(os.getenv("AUTHORIZED_CHAT_ID")) or "0")
@@ -34,7 +35,6 @@ conversation_history = deque(maxlen=20)
 # ==================== Google Calendar ====================
 
 def get_google_credentials():
-    """리프레시 토큰으로 Google Calendar 인증"""
     if not GOOGLE_REFRESH_TOKEN:
         return None
     creds = Credentials(
@@ -50,7 +50,6 @@ def get_google_credentials():
 
 
 def get_calendar_events(start_date: str, end_date: str):
-    """캘린더 일정 조회"""
     creds = get_google_credentials()
     if not creds:
         return {"error": "Google 인증이 안 됐어요. /auth/google 방문 필요"}
@@ -72,14 +71,13 @@ def get_calendar_events(start_date: str, end_date: str):
             "title": e.get('summary', '제목 없음'),
             "start": e['start'].get('dateTime', e['start'].get('date')),
             "end": e['end'].get('dateTime', e['end'].get('date')),
-            "description": e.get('description', '')[:200] if e.get('description') else '',
+            "description": (e.get('description') or '')[:200],
             "location": e.get('location', ''),
         })
     return {"count": len(simplified), "events": simplified}
 
 
 def create_calendar_event(title: str, start_datetime: str, end_datetime: str, description: str = ""):
-    """캘린더에 일정 추가"""
     creds = get_google_credentials()
     if not creds:
         return {"error": "Google 인증이 안 됐어요"}
@@ -140,7 +138,6 @@ CLAUDE_TOOLS = [
 
 
 def execute_tool(tool_name: str, tool_input: dict):
-    """Claude가 호출한 도구 실행"""
     try:
         if tool_name == "get_calendar_events":
             return get_calendar_events(**tool_input)
@@ -154,14 +151,16 @@ def execute_tool(tool_name: str, tool_input: dict):
 
 # ==================== Claude 대화 ====================
 
-SYSTEM_PROMPT = f"""당신은 ReboundX HQ 대표(magon)의 개인 비서 AI입니다.
+SYSTEM_PROMPT = f"""당신은 ReboundX 대표 magon님의 개인 비서 AI입니다.
 
 오늘 날짜: {datetime.now().strftime('%Y-%m-%d (%A)')}
 타임존: Asia/Seoul
 
 회사 컨텍스트:
-- 회사: Umbrella X HQ
-- 제품: ReboundX (리베이트), Terminal (베타 출시 준비 중), Lux
+- 회사: ReboundX
+- 제품:
+  - ReboundX (리베이트 서비스)
+  - Terminal (5/22 이후 MVP 배포 예정)
 - 주요 인물: 정예진, 이승원, 권은서(Althea), magon
 
 당신은 다음 도구를 사용할 수 있습니다:
@@ -178,7 +177,6 @@ SYSTEM_PROMPT = f"""당신은 ReboundX HQ 대표(magon)의 개인 비서 AI입�
 
 
 async def get_claude_response(user_message: str) -> str:
-    """대화 + 도구 사용 (agentic loop)"""
     conversation_history.append({"role": "user", "content": user_message})
     
     max_iterations = 5
@@ -196,14 +194,12 @@ async def get_claude_response(user_message: str) -> str:
             print(f"[claude error] {e}")
             return f"⚠️ Claude 호출 에러: {str(e)[:200]}"
         
-        # Claude 응답을 히스토리에 저장
         conversation_history.append({
             "role": "assistant",
             "content": [block.model_dump() for block in response.content]
         })
         
         if response.stop_reason == "tool_use":
-            # 도구 호출 처리
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -220,9 +216,7 @@ async def get_claude_response(user_message: str) -> str:
                 "role": "user",
                 "content": tool_results
             })
-            # 루프 계속 - Claude가 결과 보고 답변 또는 추가 도구 호출
         else:
-            # Claude 답변 완료
             text_blocks = [b.text for b in response.content if b.type == "text"]
             return "\n".join(text_blocks) if text_blocks else "응답이 비어있어요 🤔"
     
@@ -277,56 +271,12 @@ async def telegram_webhook(request: Request):
 
 # ==================== Google OAuth ====================
 
-@app.get("/auth/google")
-def auth_google():
-    flow = Flow.from_client_config({
+# 두 OAuth 요청 사이에 Flow 객체 공유용 (PKCE code_verifier 유지)
+_oauth_flow_instance = None
+
+
+def _create_google_flow():
+    return Flow.from_client_config({
         "web": {
             "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [REDIRECT_URI]
-        }
-    }, scopes=GOOGLE_SCOPES)
-    flow.redirect_uri = REDIRECT_URI
-    auth_url, _ = flow.authorization_url(
-        access_type='offline',
-        prompt='consent',
-        include_granted_scopes='true'
-    )
-    return RedirectResponse(auth_url)
-
-
-@app.get("/auth/google/callback")
-def auth_google_callback(code: str):
-    flow = Flow.from_client_config({
-        "web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [REDIRECT_URI]
-        }
-    }, scopes=GOOGLE_SCOPES)
-    flow.redirect_uri = REDIRECT_URI
-    flow.fetch_token(code=code)
-    
-    refresh_token = flow.credentials.refresh_token
-    
-    return HTMLResponse(f"""
-    <html><body style="font-family:sans-serif;padding:40px;max-width:700px;margin:auto">
-    <h1>✅ 인증 성공!</h1>
-    <p>아래 값을 <b>Railway → Variables</b>에 <b>GOOGLE_REFRESH_TOKEN</b>으로 추가하세요:</p>
-    <pre style="background:#f0f0f0;padding:20px;border-radius:8px;word-break:break-all;font-size:14px">{refresh_token}</pre>
-    <p style="color:#666">추가 후 Deploy 클릭, 1분 대기 후 텔레그램에서 "내일 일정 뭐 있어?" 테스트.</p>
-    </body></html>
-    """)
-
-
-@app.get("/")
-def root():
-    return {
-        "status": "running",
-        "google_authed": bool(GOOGLE_REFRESH_TOKEN),
-        "history": len(conversation_history)
-    }
+            "c

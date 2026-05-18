@@ -279,4 +279,62 @@ def _create_google_flow():
     return Flow.from_client_config({
         "web": {
             "client_id": GOOGLE_CLIENT_ID,
-            "c
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [REDIRECT_URI]
+        }
+    }, scopes=GOOGLE_SCOPES)
+
+
+@app.get("/auth/google")
+def auth_google():
+    global _oauth_flow_instance
+    _oauth_flow_instance = _create_google_flow()
+    _oauth_flow_instance.redirect_uri = REDIRECT_URI
+    auth_url, _ = _oauth_flow_instance.authorization_url(
+        access_type='offline',
+        prompt='consent',
+        include_granted_scopes='true'
+    )
+    return RedirectResponse(auth_url)
+
+
+@app.get("/auth/google/callback")
+def auth_google_callback(code: str):
+    global _oauth_flow_instance
+    if _oauth_flow_instance is None:
+        return HTMLResponse(
+            "<h1>⚠️ Flow 초기화 안 됨</h1>"
+            "<p>먼저 <code>/auth/google</code>을 방문하세요.</p>"
+        )
+    
+    _oauth_flow_instance.fetch_token(code=code)
+    refresh_token = _oauth_flow_instance.credentials.refresh_token
+    _oauth_flow_instance = None
+    
+    if not refresh_token:
+        return HTMLResponse(
+            "<h1>⚠️ Refresh Token이 비어있어요</h1>"
+            "<p>이미 권한을 허용한 적이 있어서 그래요.<br>"
+            "<a href='https://myaccount.google.com/permissions'>Google 권한 페이지</a>에서 "
+            "'Personal Agent' 항목을 삭제 후 다시 시도하세요.</p>"
+        )
+    
+    return HTMLResponse(f"""
+    <html><body style="font-family:sans-serif;padding:40px;max-width:700px;margin:auto">
+    <h1>✅ 인증 성공!</h1>
+    <p>아래 값을 <b>Railway → Variables</b>에 <b>GOOGLE_REFRESH_TOKEN</b>으로 추가하세요:</p>
+    <pre style="background:#f0f0f0;padding:20px;border-radius:8px;word-break:break-all;font-size:14px">{refresh_token}</pre>
+    <p style="color:#666">추가 후 Deploy 클릭, 1분 대기 후 텔레그램에서 "내일 일정 뭐 있어?" 테스트.</p>
+    </body></html>
+    """)
+
+
+@app.get("/")
+def root():
+    return {
+        "status": "running",
+        "google_authed": bool(GOOGLE_REFRESH_TOKEN),
+        "history": len(conversation_history)
+    }

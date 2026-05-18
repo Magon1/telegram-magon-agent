@@ -454,3 +454,378 @@ CLAUDE_TOOLS = [
     {
         "name": "list_indexed_documents",
         "description": "지식 베이스 통계 (총 청크 수)",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "sync_drive_folder",
+        "description": "Google Drive의 Knowledge Base 폴더를 스캔해서 새 문서 자동 인덱싱. 사장님이 '드라이브 동기화', '새 자료 업데이트' 요청 시 사용.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "list_calendars",
+        "description": "접근 가능한 모든 캘린더",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "get_calendar_events",
+        "description": "캘린더 일정 조회. calendar_id로 본인/팀원 구분.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start_date": {"type": "string"},
+                "end_date": {"type": "string"},
+                "calendar_id": {"type": "string", "default": "primary"}
+            },
+            "required": ["start_date", "end_date"]
+        }
+    },
+    {
+        "name": "create_calendar_event",
+        "description": "본인 캘린더에 일정 추가",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "start_datetime": {"type": "string"},
+                "end_datetime": {"type": "string"},
+                "description": {"type": "string"}
+            },
+            "required": ["title", "start_datetime", "end_datetime"]
+        }
+    },
+    {
+        "name": "list_slack_channels",
+        "description": "슬랙 채널 목록",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "search_slack_channel",
+        "description": "키워드로 채널 찾고 메시지 조회",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "channel_name_or_keyword": {"type": "string"},
+                "limit": {"type": "integer", "default": 30}
+            },
+            "required": ["channel_name_or_keyword"]
+        }
+    },
+    {
+        "name": "get_slack_channel_messages",
+        "description": "특정 채널 N시간 메시지",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "channel_id": {"type": "string"},
+                "hours_ago": {"type": "integer", "default": 24}
+            },
+            "required": ["channel_id"]
+        }
+    },
+    {
+        "name": "send_slack_message",
+        "description": "슬랙 메시지 발송 (명시적 요청 시만)",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "channel_id": {"type": "string"},
+                "text": {"type": "string"}
+            },
+            "required": ["channel_id", "text"]
+        }
+    }
+]
+
+
+async def execute_tool(tool_name: str, tool_input: dict):
+    try:
+        if tool_name == "search_knowledge_base":
+            return search_knowledge_base(**tool_input)
+        elif tool_name == "list_indexed_documents":
+            return list_indexed_documents()
+        elif tool_name == "sync_drive_folder":
+            return await sync_drive_folder()
+        elif tool_name == "list_calendars":
+            return list_calendars()
+        elif tool_name == "get_calendar_events":
+            return get_calendar_events(**tool_input)
+        elif tool_name == "create_calendar_event":
+            return create_calendar_event(**tool_input)
+        elif tool_name == "list_slack_channels":
+            return await list_slack_channels()
+        elif tool_name == "search_slack_channel":
+            return await search_slack_channel(**tool_input)
+        elif tool_name == "get_slack_channel_messages":
+            return await get_slack_channel_messages(**tool_input)
+        elif tool_name == "send_slack_message":
+            return await send_slack_message(**tool_input)
+        else:
+            return {"error": f"알 수 없는 도구: {tool_name}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ==================== Claude ====================
+
+SYSTEM_PROMPT = f"""당신은 ReboundX 대표 magon님의 개인 비서 AI입니다.
+
+오늘 날짜: {datetime.now().strftime('%Y-%m-%d (%A)')}
+타임존: Asia/Seoul
+
+회사 컨텍스트:
+- 회사: ReboundX
+- 제품: ReboundX (리베이트 서비스), Terminal (5/22 이후 MVP 배포 예정)
+- 주요 인물: 정예진, 이승원, 권은서(Althea), magon
+
+도구:
+[지식 베이스] search_knowledge_base, list_indexed_documents, sync_drive_folder
+[캘린더] list_calendars, get_calendar_events, create_calendar_event
+[슬랙] list_slack_channels, search_slack_channel, get_slack_channel_messages, send_slack_message
+
+원칙:
+- 회사 내부 문서·IR 덱·딜 자료 질문 → search_knowledge_base 먼저
+- 검색 결과 있으면 파일명+페이지 인용 (예: "IR_Deck.pdf p.12에 따르면...")
+- "드라이브 동기화", "새 자료 가져와" → sync_drive_folder
+- 팀원 일정 → list_calendars로 누가 공유했나 확인 후 get_calendar_events
+- 슬랙 메시지 발송은 명시적 요청 시만
+
+스타일: 한국어, 존댓말, 간결, 정확. 모르면 모른다고.
+"""
+
+
+async def get_claude_response(user_message: str) -> str:
+    conversation_history.append({"role": "user", "content": user_message})
+    
+    for _ in range(10):
+        try:
+            response = await claude.messages.create(
+                model="claude-sonnet-4-5",
+                max_tokens=4096,
+                system=SYSTEM_PROMPT,
+                tools=CLAUDE_TOOLS,
+                messages=list(conversation_history),
+            )
+        except Exception as e:
+            print(f"[claude error] {e}")
+            return f"⚠️ Claude 에러: {str(e)[:200]}"
+        
+        conversation_history.append({
+            "role": "assistant",
+            "content": [block.model_dump() for block in response.content]
+        })
+        
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    print(f"[tool] {block.name}")
+                    result = await execute_tool(block.name, dict(block.input))
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(result, ensure_ascii=False)[:8000]
+                    })
+            conversation_history.append({"role": "user", "content": tool_results})
+        else:
+            text_blocks = [b.text for b in response.content if b.type == "text"]
+            return "\n".join(text_blocks) if text_blocks else "응답 비어있음 🤔"
+    
+    return "⚠️ 도구 호출 너무 많음"
+
+
+# ==================== Telegram ====================
+
+async def send_telegram_message(chat_id: int, text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    async with httpx.AsyncClient(timeout=60) as client:
+        await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+
+
+async def download_telegram_file(file_id: str) -> tuple:
+    async with httpx.AsyncClient(timeout=120) as client:
+        info = await client.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+            params={"file_id": file_id}
+        )
+        info_json = info.json()
+        
+        if not info_json.get("ok"):
+            raise Exception(f"파일 정보 조회 실패: {info_json}")
+        
+        file_path = info_json["result"]["file_path"]
+        
+        resp = await client.get(
+            f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        )
+        resp.raise_for_status()
+        return file_path.split("/")[-1], resp.content
+
+
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    if "message" not in data:
+        return {"ok": True}
+    
+    message = data["message"]
+    chat_id = message["chat"]["id"]
+    
+    if chat_id != AUTHORIZED_CHAT_ID:
+        return {"ok": True}
+    
+    # 파일 업로드
+    if "document" in message:
+        doc = message["document"]
+        file_id = doc["file_id"]
+        filename = doc.get("file_name", "unknown")
+        file_size_mb = doc.get("file_size", 0) / 1024 / 1024
+        
+        if file_size_mb > 20:
+            await send_telegram_message(chat_id, 
+                f"⚠️ *{filename}* ({file_size_mb:.1f}MB) 텔레그램 한계 20MB 초과\n"
+                f"💡 Google Drive 'Knowledge Base' 폴더에 업로드 후 \"드라이브 동기화\" 보내주세요")
+            return {"ok": True}
+        
+        await send_telegram_message(chat_id, f"📥 *{filename}* 받았어요. 처리 중...")
+        
+        try:
+            _, file_bytes = await download_telegram_file(file_id)
+            result = await index_document(filename, file_bytes, source="telegram")
+            
+            if result.get("success"):
+                await send_telegram_message(chat_id,
+                    f"✅ *{filename}* 인덱싱 완료\n"
+                    f"📄 {result['pages']}페이지 → {result['chunks']}개 청크")
+            else:
+                await send_telegram_message(chat_id, f"❌ 실패: {result.get('error')}")
+        except Exception as e:
+            await send_telegram_message(chat_id, f"❌ 처리 에러: {str(e)[:200]}")
+        return {"ok": True}
+    
+    text = message.get("text", "")
+    
+    if text.strip() == "/reset":
+        conversation_history.clear()
+        await send_telegram_message(chat_id, "🔄 대화 기억 초기화")
+        return {"ok": True}
+    
+    if text.strip() == "/sync":
+        await send_telegram_message(chat_id, "🔄 Drive 폴더 스캔 중...")
+        result = await sync_drive_folder()
+        if result.get("error"):
+            await send_telegram_message(chat_id, f"❌ {result['error']}")
+        else:
+            msg = f"✅ 동기화 완료\n"
+            msg += f"📥 신규 인덱싱: {result['indexed_count']}개\n"
+            msg += f"⏭ 스킵: {result['skipped_count']}개\n"
+            msg += f"❌ 실패: {result['failed_count']}개"
+            if result['indexed']:
+                msg += "\n\n*신규:*\n" + "\n".join(f"• {n}" for n in result['indexed'][:10])
+            await send_telegram_message(chat_id, msg)
+        return {"ok": True}
+    
+    if text.strip() == "/help":
+        await send_telegram_message(chat_id,
+            "*기능*\n"
+            "📅 캘린더 조회/추가\n"
+            "💬 슬랙 조회/발송\n"
+            "📚 문서 업로드 (20MB까지 텔레그램, 더 크면 Drive)\n"
+            "🔍 문서 검색\n\n"
+            "*명령어*\n"
+            "/reset - 대화 초기화\n"
+            "/sync - Drive 폴더 동기화\n"
+            "/auth - Google 인증\n"
+            "/help - 도움말")
+        return {"ok": True}
+    
+    if text.strip() == "/auth":
+        await send_telegram_message(chat_id, f"https://{RAILWAY_URL}/auth/google")
+        return {"ok": True}
+    
+    reply = await get_claude_response(text)
+    await send_telegram_message(chat_id, reply)
+    return {"ok": True}
+
+
+# ==================== Slack 이벤트 (파일 자동 인덱싱) ====================
+
+@app.post("/slack/events")
+async def slack_events(request: Request):
+    """Slack에 PDF/PPT 업로드 감지 → 자동 인덱싱"""
+    data = await request.json()
+    
+    # URL 검증
+    if data.get("type") == "url_verification":
+        return {"challenge": data.get("challenge")}
+    
+    event = data.get("event", {})
+    
+    # 파일 공유 이벤트
+    if event.get("type") == "file_shared":
+        file_id = event.get("file_id") or event.get("file", {}).get("id")
+        if file_id:
+            result = await index_slack_file(file_id)
+            if result.get("success"):
+                print(f"[slack file] indexed {result['filename']}")
+            else:
+                print(f"[slack file] failed: {result.get('error')}")
+    
+    return {"ok": True}
+
+
+# ==================== Google OAuth ====================
+
+_oauth_flow_instance = None
+
+
+def _create_google_flow():
+    return Flow.from_client_config({
+        "web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [REDIRECT_URI]
+        }
+    }, scopes=GOOGLE_SCOPES)
+
+
+@app.get("/auth/google")
+def auth_google():
+    global _oauth_flow_instance
+    _oauth_flow_instance = _create_google_flow()
+    _oauth_flow_instance.redirect_uri = REDIRECT_URI
+    auth_url, _ = _oauth_flow_instance.authorization_url(
+        access_type='offline', prompt='consent', include_granted_scopes='true'
+    )
+    return RedirectResponse(auth_url)
+
+
+@app.get("/auth/google/callback")
+def auth_google_callback(code: str):
+    global _oauth_flow_instance
+    if _oauth_flow_instance is None:
+        return HTMLResponse("<h1>먼저 /auth/google 방문</h1>")
+    _oauth_flow_instance.fetch_token(code=code)
+    refresh_token = _oauth_flow_instance.credentials.refresh_token
+    _oauth_flow_instance = None
+    return HTMLResponse(f"""
+    <html><body style="font-family:sans-serif;padding:40px">
+    <h1>✅ 인증 성공</h1>
+    <p>Drive 권한도 새로 받았으니 <b>GOOGLE_REFRESH_TOKEN</b>을 아래 값으로 <b>업데이트</b>하세요:</p>
+    <pre style="background:#f0f0f0;padding:20px;border-radius:8px;word-break:break-all">{refresh_token}</pre>
+    </body></html>
+    """)
+
+
+@app.get("/")
+def root():
+    return {
+        "status": "running",
+        "google": bool(GOOGLE_REFRESH_TOKEN),
+        "slack": bool(SLACK_TOKEN),
+        "pinecone": bool(pinecone_index),
+        "voyage": bool(voyage_client),
+        "drive_folder": bool(GOOGLE_DRIVE_KB_FOLDER_ID),
+        "history": len(conversation_history)
+    }

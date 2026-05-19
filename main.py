@@ -3,6 +3,7 @@ import re
 import json
 import io
 import time
+import asyncio
 from datetime import datetime, timedelta, timezone
 from collections import deque
 from fastapi import FastAPI, Request
@@ -58,6 +59,9 @@ pinecone_index = pc.Index(PINECONE_INDEX_NAME) if pc else None
 voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY) if VOYAGE_API_KEY else None
 
 indexed_files_cache = set()
+
+# DM 스캔 중복 방지
+_dm_scan_running = False
 
 
 # ==================== 팀 컨텍스트 ====================
@@ -271,10 +275,9 @@ def list_indexed_documents() -> dict:
     return {"total_chunks": stats.get("total_vector_count", 0)}
 
 
-# ==================== Telethon (텔레그램 DM/그룹 스캔) ====================
+# ==================== Telethon ====================
 
 async def scan_telegram_messages(hours_back: int = 24) -> dict:
-    """Telethon으로 텔레그램 최근 메시지 스캔"""
     if not all([TELEGRAM_API_ID, TELEGRAM_API_HASH, TELETHON_SESSION]):
         return {"error": "Telethon 환경변수 미설정"}
     
@@ -346,7 +349,6 @@ async def scan_telegram_messages(hours_back: int = 24) -> dict:
 
 
 async def summarize_telegram_activity(hours_back: int = 24) -> dict:
-    """텔레그램 메시지 스캔 + Claude로 우선순위 분류"""
     scan_result = await scan_telegram_messages(hours_back)
     if "error" in scan_result:
         return scan_result
@@ -369,28 +371,36 @@ async def summarize_telegram_activity(hours_back: int = 24) -> dict:
 [메시지 데이터]
 {dialogs_summary}
 
-위 컨텍스트를 활용해 우선순위별로 분류하고 한국어로 정리해주세요.
+🚨 분류 원칙 (가장 중요):
+1. "개인 DM" + "팀 그룹 대화"만 우선순위 분류 (🔴🟡🟢⚪)
+2. "정보 채널"(웹프로채팅방, 머니스택, 알파방, 코인뉴스방, 잡담방, OO크립토방, OO연구소 등 다수 사람이 모인 정보·잡담성 채널)은 **절대 우선순위 분류 X**
+   → 정보 채널은 오직 "🔥 오늘의 인사이트" 섹션에만 통합 (여러 방에서 포워딩·화제된 글 위주)
+3. "⚪ 무시 가능"은 **개인/팀 대화 중 인사·잡담만** 포함. 정보 채널은 절대 X
+4. 판단 애매하면: 사장님 이름이 직접 언급되거나, 응답 요구가 명확하면 개인/팀 대화
 
 출력 형식:
-🔴 *긴급 답장 필요*
-- [채널명] 핵심 1줄 + 액션
+🔴 *긴급 답장 필요* — 개인/팀 대화만
+- [상대 이름 / 그룹명] 핵심 1줄 + 사장님 액션
 
-🟡 *답장 대기*
-- [채널명] ...
+🟡 *답장 대기* — 개인/팀 대화만
+- [상대 / 그룹명] ...
 
-🟢 *정보*
-- [채널명] ...
+🟢 *정보* — 개인/팀 대화만
+- [상대 / 그룹명] ...
 
-⚪ 무시 가능: N개 (개수만)
+⚪ *무시 가능* — 개인/팀 대화 중 잡담만 (N개, 개수만)
 
-🔥 *오늘의 인사이트* (여러 방에서 포워딩·화제된 글)
-- ...
+🔥 *오늘의 인사이트* — 정보 채널·알파방에서 추출
+① 제목
+   > 근거 채널 (3-5개 나열)
+   > 1-2줄 요약 + 사장님 비즈니스와의 연결점
 
 핵심 원칙:
-- 사장님 본인이 마지막에 답한 경우 → 액션 불필요 (🟢/⚪)
-- 상대 마지막 메시지에 사장님 답 없음 → 🔴/🟡 후보
+- 사장님이 마지막에 답한 경우 → 액션 불필요 (🟢/⚪)
 - Backpack, Variational(Lucas), Binance(jin) 특별 케어
-- 새미(나이지리아 Growth) 성과 보고는 별도 멘션"""
+- 새미(나이지리아 Growth) 성과 보고는 별도 멘션
+- 인사이트는 최소 2-3개 이상 (정보 채널이 활발하면 더)
+- 정보 채널 이름을 우선순위 섹션에 절대 넣지 말 것"""
     
     try:
         response = await claude.messages.create(
@@ -787,18 +797,19 @@ async def get_claude_response(user_message: str) -> str:
 
 async def send_telegram_message(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    # 텔레그램 메시지 길이 제한 (4096자)
     if len(text) > 4000:
         chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
         async with httpx.AsyncClient(timeout=60) as client:
             for chunk in chunks:
-                await client.post(url, json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"})
+                try:
+                    await client.post(url, json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"})
+                except Exception:
+                    await client.post(url, json={"chat_id": chat_id, "text": chunk})
         return
     async with httpx.AsyncClient(timeout=60) as client:
         try:
             await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
         except Exception:
-            # Markdown 파싱 에러 시 plain text로 재시도
             await client.post(url, json={"chat_id": chat_id, "text": text})
 
 
@@ -815,6 +826,22 @@ async def download_telegram_file(file_id: str) -> tuple:
         resp = await client.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}")
         resp.raise_for_status()
         return file_path.split("/")[-1], resp.content
+
+
+async def _run_dm_scan_task(chat_id: int, hours: int):
+    """백그라운드 DM 스캔"""
+    global _dm_scan_running
+    _dm_scan_running = True
+    try:
+        result = await summarize_telegram_activity(hours_back=hours)
+        if "error" in result:
+            await send_telegram_message(chat_id, f"❌ {result['error']}")
+        else:
+            await send_telegram_message(chat_id, result.get('summary', '결과 없음'))
+    except Exception as e:
+        await send_telegram_message(chat_id, f"❌ 처리 에러: {str(e)[:200]}")
+    finally:
+        _dm_scan_running = False
 
 
 @app.post("/webhook")
@@ -856,18 +883,19 @@ async def telegram_webhook(request: Request):
     
     text = message.get("text", "")
     
-    # /dm — 텔레그램 DM 정리 (Telethon)
+    # /dm — 텔레그램 DM 정리 (백그라운드 처리, webhook 즉시 응답)
     if text.strip().startswith("/dm"):
         parts = text.strip().split()
         hours = 24
         if len(parts) > 1 and parts[1].isdigit():
             hours = int(parts[1])
-        await send_telegram_message(chat_id, f"📡 텔레그램 최근 *{hours}시간* 스캔 중... (1-3분 걸려요)")
-        result = await summarize_telegram_activity(hours_back=hours)
-        if "error" in result:
-            await send_telegram_message(chat_id, f"❌ {result['error']}")
-        else:
-            await send_telegram_message(chat_id, result.get('summary', '결과 없음'))
+        
+        if _dm_scan_running:
+            await send_telegram_message(chat_id, "⚠️ 이미 스캔 진행 중이에요. 끝나면 결과 보내드릴게요.")
+            return {"ok": True}
+        
+        await send_telegram_message(chat_id, f"📡 텔레그램 최근 *{hours}시간* 스캔 시작... (2-5분 걸려요)")
+        asyncio.create_task(_run_dm_scan_task(chat_id, hours))
         return {"ok": True}
     
     if text.strip() == "/reset":
@@ -976,5 +1004,6 @@ def root():
         "voyage": bool(voyage_client),
         "drive_folder": bool(GOOGLE_DRIVE_KB_FOLDER_ID),
         "telethon": bool(TELETHON_SESSION),
+        "dm_scanning": _dm_scan_running,
         "history": len(conversation_history)
     }

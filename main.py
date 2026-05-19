@@ -3,7 +3,7 @@ import re
 import json
 import io
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from collections import deque
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse, HTMLResponse
@@ -19,6 +19,8 @@ import voyageai
 from pypdf import PdfReader
 from pptx import Presentation
 from docx import Document
+from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 app = FastAPI()
 
@@ -36,6 +38,10 @@ SLACK_TOKEN = _clean(os.getenv("SLACK_BOT_TOKEN") or os.getenv("SLACK_USER_TOKEN
 PINECONE_API_KEY = _clean(os.getenv("PINECONE_API_KEY"))
 PINECONE_INDEX_NAME = _clean(os.getenv("PINECONE_INDEX_NAME")) or "knowledge-base"
 VOYAGE_API_KEY = _clean(os.getenv("VOYAGE_API_KEY"))
+TELEGRAM_API_ID = int(_clean(os.getenv("TELEGRAM_API_ID")) or "0")
+TELEGRAM_API_HASH = _clean(os.getenv("TELEGRAM_API_HASH"))
+TELEGRAM_PHONE = _clean(os.getenv("TELEGRAM_PHONE"))
+TELETHON_SESSION = _clean(os.getenv("TELETHON_SESSION"))
 RAILWAY_URL = _clean(os.getenv("RAILWAY_PUBLIC_DOMAIN") or "web-production-87eec.up.railway.app")
 
 REDIRECT_URI = f"https://{RAILWAY_URL}/auth/google/callback"
@@ -47,57 +53,87 @@ GOOGLE_SCOPES = [
 claude = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 conversation_history = deque(maxlen=20)
 
-# Pinecone + Voyage 초기화
 pc = Pinecone(api_key=PINECONE_API_KEY) if PINECONE_API_KEY else None
 pinecone_index = pc.Index(PINECONE_INDEX_NAME) if pc else None
 voyage_client = voyageai.Client(api_key=VOYAGE_API_KEY) if VOYAGE_API_KEY else None
 
-# 이미 인덱싱한 파일 추적 (메모리)
 indexed_files_cache = set()
+
+
+# ==================== 팀 컨텍스트 ====================
+
+TEAM_CONTEXT = """
+[ReboundX/UmbrellaX 핵심 팀 - 우선 팔로업]
+
+a) Binance BD - Jin (ReboundX BD 메인 채널)
+   - Binance/Tech-API: pablo가 만든 ReboundX 터미널 건의사항 채널
+   - Binance/MKT-Aff: pablo (글로벌 affiliate팀) 소속 방. jin (한국팀)으로 소속 이전 중
+   - jin/pablo 모두 우호적이지만 pablo에게 미안한 정치적 상황
+
+b) Variational (Lucas) - 매우 친밀, IR덱 VC 전달 진행 중, KBW Perpdexday 같이 참가
+   - TGE 이전 / 초기부터 협력. 친근한 톤 유지
+
+c) Backpack ⭐ 알파방, 민감 정보 多
+   - 한국 제1 파트너, 한국 마케팅 탁월한 성과
+   - 주식 거래 기능 오픈 직전 - 한국 볼륨 필요
+   - 토큰 가격 하락으로 힘들었음 - 특별 케어 필요
+
+d) ReboundX 회의실 - 내부 직원 회의실 (포워딩/공유용)
+
+e) edgeX - 과거 친했으나 현재 소통 줄어듦. 중요. 재연결 필요
+
+f) Nado - KBW Perpdex Day 참가 예정. 협업 잠재력. 기획/팔로업 필요
+
+g) ReboundX CM&Growth - 새미 (나이지리아 Growth/CM)
+   - 성과 추적 + 다음 스텝 제시 + 독려 필요
+   - 아직 가시적 성과 적음
+
+h) PerpDex Day KBW '26 - Ostium 팀. RWAday 가능. althea 소통 중
+
+i) Bybit - 이슈/요청 빠른 체크 필요
+
+j) Pharos - KBW 2티어/3티어 소규모 밋업 기획 중
+
+[기타]
+- Re/UM X 그룹방: 우선 팔로업 필요
+- Call alpha 그룹: 채팅수 급증·특이정보 시 팔로업
+- 개인 DM: 오래 답 안 하면 삐질 수 있음 → 팔로업
+- 모든 채널: 여러 방에서 포워딩 화제된 글·인사이트 추출
+"""
+
+PRIORITY_RULES = """
+우선순위 분류:
+🔴 긴급 답장 필요 — 24시간 이상 답 없는 중요 메시지, 액션 필요
+🟡 답장 대기 — 답변 필요한 중요정보, 팔로업해야함
+🟢 정보 — 알아만 두면 됨
+⚪ 무시 가능 — 인사·잡담
+"""
 
 
 # ==================== 모델 라우터 ====================
 
 def select_model(user_message: str) -> str:
-    """질문 내용에 따라 적절한 Claude 모델 선택"""
-    
     msg = user_message.lower().strip()
-    
-    # 명시적 모델 지정 (최우선)
-    if any(msg.startswith(prefix) for prefix in ("/opus", "/think", "/deep", "/깊게")):
+    if any(msg.startswith(p) for p in ("/opus", "/think", "/deep", "/깊게")):
         return "claude-opus-4-7"
-    if any(msg.startswith(prefix) for prefix in ("/sonnet", "/balanced")):
+    if any(msg.startswith(p) for p in ("/sonnet", "/balanced")):
         return "claude-sonnet-4-6"
-    if any(msg.startswith(prefix) for prefix in ("/haiku", "/quick", "/fast", "/빠르게")):
+    if any(msg.startswith(p) for p in ("/haiku", "/quick", "/fast", "/빠르게")):
         return "claude-haiku-4-5-20251001"
-    
-    # Sonnet 트리거 키워드 (전략/분석/기획)
     sonnet_keywords = [
-        # 전략·기획
         "전략", "기획", "방향성", "로드맵", "방안", "대안",
-        # 분석·검토
         "분석", "검토", "비교", "장단점", "리스크", "전망", "예측",
-        # 의사결정
         "어떻게 생각", "조언", "추천", "솔직하게", "의견", "판단",
         "어떡하지", "어떻게 해야", "고민",
-        # 작성·정리
         "초안", "보고서", "제안서", "정리해",
-        # 비즈니스
         "bm", "비즈니스 모델", "ir", "투자", "vc", "딜", "deal",
-        "valuation", "밸류에이션",
-        # 사고력 요구
-        "왜", "이유", "근거"
+        "valuation", "밸류에이션", "왜", "이유", "근거"
     ]
-    
     for kw in sonnet_keywords:
         if kw in msg:
             return "claude-sonnet-4-6"
-    
-    # 긴 질문은 보통 복잡함
     if len(user_message) > 200:
         return "claude-sonnet-4-6"
-    
-    # 기본: Haiku (빠르고 저렴)
     return "claude-haiku-4-5-20251001"
 
 
@@ -157,8 +193,7 @@ def extract_text(filename: str, file_bytes: bytes) -> list:
         text = file_bytes.decode('utf-8', errors='ignore')
         chunks = [text[i:i+1000] for i in range(0, len(text), 1000)]
         return [{"page": i+1, "text": c} for i, c in enumerate(chunks)]
-    else:
-        return []
+    return []
 
 
 # ==================== RAG ====================
@@ -190,57 +225,41 @@ def embed_texts(texts: list) -> list:
 async def index_document(filename: str, file_bytes: bytes, source: str = "telegram") -> dict:
     if not pinecone_index or not voyage_client:
         return {"error": "Pinecone 또는 Voyage 미설정"}
-    
     pages = extract_text(filename, file_bytes)
     if not pages:
         return {"error": f"지원 안 하거나 빈 파일: {filename}"}
-    
     vectors_to_upsert = []
     chunk_count = 0
-    
     for page_info in pages:
         page_num = page_info["page"]
         text = page_info["text"]
         chunks = chunk_text(text, max_chars=1500)
         if not chunks:
             continue
-        
         embeddings = embed_texts(chunks)
-        
         for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-            vector_id = f"{filename}::page{page_num}::chunk{i}"
             vectors_to_upsert.append({
-                "id": vector_id,
+                "id": f"{filename}::page{page_num}::chunk{i}",
                 "values": emb,
                 "metadata": {
-                    "filename": filename,
-                    "page": page_num,
-                    "text": chunk[:2000],
-                    "source": source,
-                    "indexed_at": datetime.now().isoformat()
+                    "filename": filename, "page": page_num, "text": chunk[:2000],
+                    "source": source, "indexed_at": datetime.now().isoformat()
                 }
             })
             chunk_count += 1
-    
     for i in range(0, len(vectors_to_upsert), 100):
-        batch = vectors_to_upsert[i:i+100]
-        pinecone_index.upsert(vectors=batch)
-    
+        pinecone_index.upsert(vectors=vectors_to_upsert[i:i+100])
     return {"success": True, "filename": filename, "pages": len(pages), "chunks": chunk_count}
 
 
 def search_knowledge_base(query: str, top_k: int = 5) -> dict:
     if not pinecone_index or not voyage_client:
         return {"error": "Pinecone 또는 Voyage 미설정"}
-    
     query_emb = voyage_client.embed(texts=[query], model="voyage-3", input_type="query").embeddings[0]
     results = pinecone_index.query(vector=query_emb, top_k=top_k, include_metadata=True)
-    
     return {"count": len(results.matches), "matches": [{
-        "filename": m.metadata.get("filename", ""),
-        "page": m.metadata.get("page", 0),
-        "score": round(m.score, 3),
-        "text": m.metadata.get("text", ""),
+        "filename": m.metadata.get("filename", ""), "page": m.metadata.get("page", 0),
+        "score": round(m.score, 3), "text": m.metadata.get("text", ""),
         "source": m.metadata.get("source", "")
     } for m in results.matches]}
 
@@ -252,17 +271,151 @@ def list_indexed_documents() -> dict:
     return {"total_chunks": stats.get("total_vector_count", 0)}
 
 
+# ==================== Telethon (텔레그램 DM/그룹 스캔) ====================
+
+async def scan_telegram_messages(hours_back: int = 24) -> dict:
+    """Telethon으로 텔레그램 최근 메시지 스캔"""
+    if not all([TELEGRAM_API_ID, TELEGRAM_API_HASH, TELETHON_SESSION]):
+        return {"error": "Telethon 환경변수 미설정"}
+    
+    client = TelegramClient(StringSession(TELETHON_SESSION), TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            return {"error": "Telethon 세션 만료. 로컬에서 재인증 필요"}
+        
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+        dialogs_data = []
+        
+        async for dialog in client.iter_dialogs(limit=80):
+            if dialog.date and dialog.date < cutoff:
+                continue
+            
+            messages = []
+            try:
+                async for msg in client.iter_messages(dialog.entity, limit=30):
+                    if not msg.date or msg.date < cutoff:
+                        break
+                    if not msg.text:
+                        continue
+                    
+                    sender_name = "?"
+                    if msg.sender:
+                        sender_name = (
+                            getattr(msg.sender, 'first_name', None) or
+                            getattr(msg.sender, 'title', None) or
+                            getattr(msg.sender, 'username', None) or
+                            "Unknown"
+                        )
+                    
+                    messages.append({
+                        'sender': "사장님(본인)" if msg.out else sender_name,
+                        'text': (msg.text or '')[:400],
+                        'date': msg.date.strftime('%m-%d %H:%M'),
+                        'is_me': bool(msg.out)
+                    })
+            except Exception as e:
+                print(f"[telethon msg error] {dialog.name}: {e}")
+                continue
+            
+            if messages:
+                if dialog.is_channel and not dialog.is_group:
+                    dialog_type = "channel"
+                elif dialog.is_group:
+                    dialog_type = "group"
+                else:
+                    dialog_type = "dm"
+                
+                dialogs_data.append({
+                    'name': dialog.name or "Unknown",
+                    'type': dialog_type,
+                    'unread_count': dialog.unread_count,
+                    'message_count': len(messages),
+                    'messages': messages,
+                })
+        
+        return {
+            'scanned_at': datetime.now().isoformat(),
+            'hours_back': hours_back,
+            'dialog_count': len(dialogs_data),
+            'dialogs': dialogs_data
+        }
+    finally:
+        await client.disconnect()
+
+
+async def summarize_telegram_activity(hours_back: int = 24) -> dict:
+    """텔레그램 메시지 스캔 + Claude로 우선순위 분류"""
+    scan_result = await scan_telegram_messages(hours_back)
+    if "error" in scan_result:
+        return scan_result
+    if scan_result['dialog_count'] == 0:
+        return {"summary": f"최근 {hours_back}시간 활동 없음"}
+    
+    dialogs_summary = ""
+    for d in scan_result['dialogs'][:40]:
+        dialogs_summary += f"\n\n=== {d['name']} ({d['type']}, 메시지 {d['message_count']}개, 안 읽음 {d['unread_count']}) ===\n"
+        for m in d['messages'][:20]:
+            prefix = "[나]" if m['is_me'] else f"[{m['sender']}]"
+            dialogs_summary += f"{m['date']} {prefix}: {m['text']}\n"
+    
+    prompt = f"""다음은 magon님의 텔레그램 최근 {hours_back}시간 활동입니다.
+
+{TEAM_CONTEXT}
+
+{PRIORITY_RULES}
+
+[메시지 데이터]
+{dialogs_summary}
+
+위 컨텍스트를 활용해 우선순위별로 분류하고 한국어로 정리해주세요.
+
+출력 형식:
+🔴 *긴급 답장 필요*
+- [채널명] 핵심 1줄 + 액션
+
+🟡 *답장 대기*
+- [채널명] ...
+
+🟢 *정보*
+- [채널명] ...
+
+⚪ 무시 가능: N개 (개수만)
+
+🔥 *오늘의 인사이트* (여러 방에서 포워딩·화제된 글)
+- ...
+
+핵심 원칙:
+- 사장님 본인이 마지막에 답한 경우 → 액션 불필요 (🟢/⚪)
+- 상대 마지막 메시지에 사장님 답 없음 → 🔴/🟡 후보
+- Backpack, Variational(Lucas), Binance(jin) 특별 케어
+- 새미(나이지리아 Growth) 성과 보고는 별도 멘션"""
+    
+    try:
+        response = await claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        summary_text = response.content[0].text
+        return {
+            'summary': summary_text,
+            'dialog_count': scan_result['dialog_count']
+        }
+    except Exception as e:
+        return {"error": f"Claude 분류 에러: {str(e)[:200]}"}
+
+
 # ==================== Google Calendar / Drive ====================
 
 def get_google_credentials():
     if not GOOGLE_REFRESH_TOKEN:
         return None
     creds = Credentials(
-        token=None,
-        refresh_token=GOOGLE_REFRESH_TOKEN,
+        token=None, refresh_token=GOOGLE_REFRESH_TOKEN,
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
+        client_id=GOOGLE_CLIENT_ID, client_secret=GOOGLE_CLIENT_SECRET,
         scopes=GOOGLE_SCOPES,
     )
     creds.refresh(GoogleRequest())
@@ -271,45 +424,28 @@ def get_google_credentials():
 
 def get_drive_service():
     creds = get_google_credentials()
-    if not creds:
-        return None
-    return build('drive', 'v3', credentials=creds)
+    return build('drive', 'v3', credentials=creds) if creds else None
 
 
 async def sync_drive_folder():
-    """KB 폴더의 새 파일을 자동 인덱싱"""
     if not GOOGLE_DRIVE_KB_FOLDER_ID:
         return {"error": "GOOGLE_DRIVE_KB_FOLDER_ID 미설정"}
-    
     service = get_drive_service()
     if not service:
         return {"error": "Drive 인증 안 됨"}
-    
     query = f"'{GOOGLE_DRIVE_KB_FOLDER_ID}' in parents and trashed=false"
-    results = service.files().list(
-        q=query,
-        fields="files(id, name, mimeType, size, modifiedTime)",
-        pageSize=100
-    ).execute()
-    
+    results = service.files().list(q=query, fields="files(id, name, mimeType, size, modifiedTime)", pageSize=100).execute()
     files = results.get('files', [])
-    indexed = []
-    skipped = []
-    failed = []
-    
+    indexed, skipped, failed = [], [], []
     for f in files:
-        file_id = f['id']
-        filename = f['name']
-        
+        file_id, filename = f['id'], f['name']
         cache_key = f"drive::{file_id}::{f.get('modifiedTime', '')}"
         if cache_key in indexed_files_cache:
             skipped.append(filename)
             continue
-        
         if not filename.lower().endswith(('.pdf', '.pptx', '.docx', '.txt', '.md')):
             skipped.append(f"{filename} (지원 안 함)")
             continue
-        
         try:
             request = service.files().get_media(fileId=file_id)
             file_bytes = io.BytesIO()
@@ -317,7 +453,6 @@ async def sync_drive_folder():
             done = False
             while not done:
                 _, done = downloader.next_chunk()
-            
             result = await index_document(filename, file_bytes.getvalue(), source="drive")
             if result.get("success"):
                 indexed.append(f"{filename} ({result['pages']}p, {result['chunks']}c)")
@@ -326,13 +461,9 @@ async def sync_drive_folder():
                 failed.append(f"{filename}: {result.get('error')}")
         except Exception as e:
             failed.append(f"{filename}: {str(e)[:100]}")
-    
     return {
-        "indexed_count": len(indexed),
-        "skipped_count": len(skipped),
-        "failed_count": len(failed),
-        "indexed": indexed,
-        "failed": failed[:5]
+        "indexed_count": len(indexed), "skipped_count": len(skipped), "failed_count": len(failed),
+        "indexed": indexed, "failed": failed[:5]
     }
 
 
@@ -397,25 +528,6 @@ async def slack_api_call(method: str, payload: dict = None):
         return response.json()
 
 
-async def index_slack_file(file_id: str) -> dict:
-    if not SLACK_TOKEN:
-        return {"error": "Slack 토큰 없음"}
-    file_info = await slack_api_call("files.info", {"file": file_id})
-    if not file_info.get("ok"):
-        return {"error": f"파일 정보 조회 실패: {file_info.get('error')}"}
-    file_data = file_info["file"]
-    filename = file_data.get("name", "unknown")
-    download_url = file_data.get("url_private_download") or file_data.get("url_private")
-    if not download_url:
-        return {"error": "다운로드 URL 없음"}
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.get(download_url, headers={"Authorization": f"Bearer {SLACK_TOKEN}"})
-        if resp.status_code != 200:
-            return {"error": f"다운로드 실패: HTTP {resp.status_code}"}
-        file_bytes = resp.content
-    return await index_document(filename, file_bytes, source="slack")
-
-
 async def search_slack_channel(channel_name_or_keyword: str, limit: int = 30):
     if not SLACK_TOKEN:
         return {"error": "Slack 미설정"}
@@ -465,8 +577,18 @@ async def list_slack_channels():
 
 CLAUDE_TOOLS = [
     {
+        "name": "scan_telegram_dms",
+        "description": "사장님의 텔레그램 DM/그룹/채널 최근 메시지를 스캔하고 팀별/우선순위별로 정리. '오늘 답장할 거 있어?', '텔레그램 정리해줘', '크립토팀 동향', 'Backpack 최근 어떻게 됐어?' 같은 질문에 사용. 1-3분 걸림.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "hours_back": {"type": "integer", "description": "몇 시간 전부터 (기본 24)", "default": 24}
+            }
+        }
+    },
+    {
         "name": "search_knowledge_base",
-        "description": "사장님이 업로드한 문서(PDF, IR 덱, 딜 자료, 회의록 등)에서 정보 검색. 회사 내부 자료 관련 질문은 무조건 이걸 먼저.",
+        "description": "업로드한 문서(PDF/IR덱/딜자료) 검색",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -478,22 +600,22 @@ CLAUDE_TOOLS = [
     },
     {
         "name": "list_indexed_documents",
-        "description": "지식 베이스 통계 (총 청크 수)",
+        "description": "지식 베이스 통계",
         "input_schema": {"type": "object", "properties": {}}
     },
     {
         "name": "sync_drive_folder",
-        "description": "Google Drive의 Knowledge Base 폴더를 스캔해서 새 문서 자동 인덱싱.",
+        "description": "Drive KB 폴더 자동 인덱싱",
         "input_schema": {"type": "object", "properties": {}}
     },
     {
         "name": "list_calendars",
-        "description": "접근 가능한 모든 캘린더",
+        "description": "캘린더 목록",
         "input_schema": {"type": "object", "properties": {}}
     },
     {
         "name": "get_calendar_events",
-        "description": "캘린더 일정 조회. calendar_id로 본인/팀원 구분.",
+        "description": "캘린더 일정 조회",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -506,7 +628,7 @@ CLAUDE_TOOLS = [
     },
     {
         "name": "create_calendar_event",
-        "description": "본인 캘린더에 일정 추가",
+        "description": "일정 추가",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -525,7 +647,7 @@ CLAUDE_TOOLS = [
     },
     {
         "name": "search_slack_channel",
-        "description": "키워드로 채널 찾고 메시지 조회",
+        "description": "키워드로 슬랙 채널 검색",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -537,7 +659,7 @@ CLAUDE_TOOLS = [
     },
     {
         "name": "get_slack_channel_messages",
-        "description": "특정 채널 N시간 메시지",
+        "description": "특정 슬랙 채널 N시간 메시지",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -564,7 +686,9 @@ CLAUDE_TOOLS = [
 
 async def execute_tool(tool_name: str, tool_input: dict):
     try:
-        if tool_name == "search_knowledge_base":
+        if tool_name == "scan_telegram_dms":
+            return await summarize_telegram_activity(**tool_input)
+        elif tool_name == "search_knowledge_base":
             return search_knowledge_base(**tool_input)
         elif tool_name == "list_indexed_documents":
             return list_indexed_documents()
@@ -590,8 +714,6 @@ async def execute_tool(tool_name: str, tool_input: dict):
         return {"error": str(e)}
 
 
-# ==================== Claude ====================
-
 SYSTEM_PROMPT = f"""당신은 ReboundX 대표 magon님의 개인 비서 AI입니다.
 
 오늘 날짜: {datetime.now().strftime('%Y-%m-%d (%A)')}
@@ -599,21 +721,23 @@ SYSTEM_PROMPT = f"""당신은 ReboundX 대표 magon님의 개인 비서 AI입니
 
 회사 컨텍스트:
 - 회사: ReboundX
-- 제품: ReboundX (리베이트 서비스), Terminal (5/22 이후 MVP 배포 예정)
-- 주요 인물: 정예진, 이승원, 권은서(Althea), magon
+- 제품: ReboundX (리베이트), Terminal (MVP)
+- 주요 인물: 정예진, 이승원, 권은서(Althea), magon, 새미(나이지리아 Growth)
+
+{TEAM_CONTEXT}
 
 도구:
+[텔레그램 DM] scan_telegram_dms - 사장님의 모든 DM/그룹 우선순위별 정리
 [지식 베이스] search_knowledge_base, list_indexed_documents, sync_drive_folder
 [캘린더] list_calendars, get_calendar_events, create_calendar_event
 [슬랙] list_slack_channels, search_slack_channel, get_slack_channel_messages, send_slack_message
 
 원칙:
-- 회사 내부 문서·IR 덱·딜 자료 질문 → search_knowledge_base 먼저
-- 검색 결과 있으면 파일명+페이지 인용 (예: "IR_Deck.pdf p.12에 따르면...")
-- "드라이브 동기화", "새 자료 가져와" → sync_drive_folder
-- 팀원 일정 → list_calendars로 누가 공유했나 확인 후 get_calendar_events
+- "텔레그램 정리", "답장 대기", "크립토팀 동향" → scan_telegram_dms
+- 회사 내부 문서 질문 → search_knowledge_base 먼저
+- 검색 결과 인용 시 파일명+페이지
 - 슬랙 메시지 발송은 명시적 요청 시만
-- 간단한 인사·잡담은 도구 호출 없이 바로 답변
+- 간단한 인사·잡담은 도구 호출 없이 즉답
 
 스타일: 한국어, 존댓말, 간결, 정확. 모르면 모른다고.
 """
@@ -621,18 +745,14 @@ SYSTEM_PROMPT = f"""당신은 ReboundX 대표 magon님의 개인 비서 AI입니
 
 async def get_claude_response(user_message: str) -> str:
     conversation_history.append({"role": "user", "content": user_message})
-    
-    # 모델 선택
     model = select_model(user_message)
     print(f"[model] {model} for: {user_message[:50]}")
     
     for _ in range(10):
         try:
             response = await claude.messages.create(
-                model=model,
-                max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                tools=CLAUDE_TOOLS,
+                model=model, max_tokens=4096,
+                system=SYSTEM_PROMPT, tools=CLAUDE_TOOLS,
                 messages=list(conversation_history),
             )
         except Exception as e:
@@ -653,7 +773,7 @@ async def get_claude_response(user_message: str) -> str:
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
-                        "content": json.dumps(result, ensure_ascii=False)[:8000]
+                        "content": json.dumps(result, ensure_ascii=False)[:12000]
                     })
             conversation_history.append({"role": "user", "content": tool_results})
         else:
@@ -667,8 +787,19 @@ async def get_claude_response(user_message: str) -> str:
 
 async def send_telegram_message(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    # 텔레그램 메시지 길이 제한 (4096자)
+    if len(text) > 4000:
+        chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        async with httpx.AsyncClient(timeout=60) as client:
+            for chunk in chunks:
+                await client.post(url, json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"})
+        return
     async with httpx.AsyncClient(timeout=60) as client:
-        await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        try:
+            await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        except Exception:
+            # Markdown 파싱 에러 시 plain text로 재시도
+            await client.post(url, json={"chat_id": chat_id, "text": text})
 
 
 async def download_telegram_file(file_id: str) -> tuple:
@@ -707,19 +838,16 @@ async def telegram_webhook(request: Request):
         
         if file_size_mb > 20:
             await send_telegram_message(chat_id,
-                f"⚠️ *{filename}* ({file_size_mb:.1f}MB) 텔레그램 한계 20MB 초과\n"
-                f"💡 Google Drive 'Knowledge Base' 폴더에 업로드 후 \"드라이브 동기화\" 보내주세요")
+                f"⚠️ *{filename}* ({file_size_mb:.1f}MB) 20MB 초과\n💡 Drive 'Knowledge Base' 폴더 → /sync")
             return {"ok": True}
         
         await send_telegram_message(chat_id, f"📥 *{filename}* 받았어요. 처리 중...")
-        
         try:
             _, file_bytes = await download_telegram_file(file_id)
             result = await index_document(filename, file_bytes, source="telegram")
             if result.get("success"):
                 await send_telegram_message(chat_id,
-                    f"✅ *{filename}* 인덱싱 완료\n"
-                    f"📄 {result['pages']}페이지 → {result['chunks']}개 청크")
+                    f"✅ *{filename}* 인덱싱 완료\n📄 {result['pages']}p → {result['chunks']}c")
             else:
                 await send_telegram_message(chat_id, f"❌ 실패: {result.get('error')}")
         except Exception as e:
@@ -727,6 +855,20 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
     
     text = message.get("text", "")
+    
+    # /dm — 텔레그램 DM 정리 (Telethon)
+    if text.strip().startswith("/dm"):
+        parts = text.strip().split()
+        hours = 24
+        if len(parts) > 1 and parts[1].isdigit():
+            hours = int(parts[1])
+        await send_telegram_message(chat_id, f"📡 텔레그램 최근 *{hours}시간* 스캔 중... (1-3분 걸려요)")
+        result = await summarize_telegram_activity(hours_back=hours)
+        if "error" in result:
+            await send_telegram_message(chat_id, f"❌ {result['error']}")
+        else:
+            await send_telegram_message(chat_id, result.get('summary', '결과 없음'))
+        return {"ok": True}
     
     if text.strip() == "/reset":
         conversation_history.clear()
@@ -739,7 +881,7 @@ async def telegram_webhook(request: Request):
         if result.get("error"):
             await send_telegram_message(chat_id, f"❌ {result['error']}")
         else:
-            msg = f"✅ 동기화 완료\n📥 신규: {result['indexed_count']}개\n⏭ 스킵: {result['skipped_count']}개\n❌ 실패: {result['failed_count']}개"
+            msg = f"✅ 동기화 완료\n📥 신규: {result['indexed_count']}\n⏭ 스킵: {result['skipped_count']}\n❌ 실패: {result['failed_count']}"
             if result['indexed']:
                 msg += "\n\n*신규 인덱싱:*\n" + "\n".join(f"• {n}" for n in result['indexed'][:10])
             await send_telegram_message(chat_id, msg)
@@ -748,28 +890,23 @@ async def telegram_webhook(request: Request):
     if text.strip() == "/help":
         await send_telegram_message(chat_id,
             "*기능*\n"
+            "📡 텔레그램 DM/그룹 우선순위 정리 (`/dm` 또는 `/dm 48`)\n"
             "📅 캘린더 조회/추가\n"
             "💬 슬랙 조회/발송\n"
             "📚 문서 업로드 + RAG 검색\n\n"
             "*모델 명령어*\n"
-            "/think - Opus (깊은 사고)\n"
-            "/sonnet - Sonnet (균형)\n"
-            "/quick - Haiku (빠름)\n\n"
+            "/think - Opus / /sonnet - Sonnet / /quick - Haiku\n\n"
             "*기타*\n"
-            "/reset - 대화 초기화\n"
-            "/sync - Drive 동기화\n"
-            "/auth - Google 인증\n"
-            "/help - 도움말")
+            "/reset / /sync / /auth / /help")
         return {"ok": True}
     
     if text.strip() == "/auth":
         await send_telegram_message(chat_id, f"https://{RAILWAY_URL}/auth/google")
         return {"ok": True}
     
-    # 모델 선택 + 즉시 응답
     model_to_use = select_model(text)
     if "opus" in model_to_use:
-        await send_telegram_message(chat_id, "🧠 깊게 생각 중... (조금 더 걸려요)")
+        await send_telegram_message(chat_id, "🧠 깊게 생각 중...")
     elif "sonnet" in model_to_use:
         await send_telegram_message(chat_id, "💭 분석 중...")
     else:
@@ -787,12 +924,6 @@ async def slack_events(request: Request):
     data = await request.json()
     if data.get("type") == "url_verification":
         return {"challenge": data.get("challenge")}
-    event = data.get("event", {})
-    if event.get("type") == "file_shared":
-        file_id = event.get("file_id") or event.get("file", {}).get("id")
-        if file_id:
-            result = await index_slack_file(file_id)
-            print(f"[slack file] {result}")
     return {"ok": True}
 
 
@@ -832,13 +963,7 @@ def auth_google_callback(code: str):
     _oauth_flow_instance.fetch_token(code=code)
     refresh_token = _oauth_flow_instance.credentials.refresh_token
     _oauth_flow_instance = None
-    return HTMLResponse(f"""
-    <html><body style="font-family:sans-serif;padding:40px">
-    <h1>✅ 인증 성공</h1>
-    <p>Railway에 <b>GOOGLE_REFRESH_TOKEN</b> 업데이트:</p>
-    <pre style="background:#f0f0f0;padding:20px;border-radius:8px;word-break:break-all">{refresh_token}</pre>
-    </body></html>
-    """)
+    return HTMLResponse(f"""<html><body style="font-family:sans-serif;padding:40px"><h1>✅ 인증 성공</h1><p>Railway에 GOOGLE_REFRESH_TOKEN 업데이트:</p><pre style="background:#f0f0f0;padding:20px;border-radius:8px;word-break:break-all">{refresh_token}</pre></body></html>""")
 
 
 @app.get("/")
@@ -850,5 +975,6 @@ def root():
         "pinecone": bool(pinecone_index),
         "voyage": bool(voyage_client),
         "drive_folder": bool(GOOGLE_DRIVE_KB_FOLDER_ID),
+        "telethon": bool(TELETHON_SESSION),
         "history": len(conversation_history)
     }

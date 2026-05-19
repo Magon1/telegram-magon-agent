@@ -950,16 +950,28 @@ async def get_claude_response(user_message: str) -> str:
     model = select_model(user_message)
     print(f"[model] {model} for: {user_message[:50]}")
     
-    for _ in range(10):
+    for iteration in range(10):
         try:
-            response = await claude.messages.create(
-                model=model, max_tokens=4096,
-                system=SYSTEM_PROMPT, tools=CLAUDE_TOOLS,
-                messages=list(conversation_history),
+            # 🆕 60초 타임아웃 추가
+            response = await asyncio.wait_for(
+                claude.messages.create(
+                    model=model, max_tokens=4096,
+                    system=SYSTEM_PROMPT, tools=CLAUDE_TOOLS,
+                    messages=list(conversation_history),
+                ),
+                timeout=60.0
             )
+        except asyncio.TimeoutError:
+            print(f"[claude timeout] iteration {iteration}")
+            # 마지막 메시지 롤백
+            if conversation_history and conversation_history[-1].get("role") == "user":
+                conversation_history.pop()
+            return "⚠️ Claude 응답 60초 초과. /reset 후 다시 시도해주세요."
         except Exception as e:
             print(f"[claude error] {e}")
-            return f"⚠️ Claude 에러: {str(e)[:200]}"
+            if conversation_history and conversation_history[-1].get("role") == "user":
+                conversation_history.pop()
+            return f"⚠️ Claude 에러: {str(e)[:200]}\n\n/reset 후 다시 시도해주세요."
         
         conversation_history.append({
             "role": "assistant",
@@ -971,7 +983,17 @@ async def get_claude_response(user_message: str) -> str:
             for block in response.content:
                 if block.type == "tool_use":
                     print(f"[tool] {block.name}")
-                    result = await execute_tool(block.name, dict(block.input))
+                    try:
+                        # 🆕 도구별 타임아웃 (RAG/Telethon/Drive는 오래 걸릴 수 있어 별도)
+                        timeout = 300.0 if block.name in ("scan_telegram_dms", "sync_drive_folder") else 60.0
+                        result = await asyncio.wait_for(
+                            execute_tool(block.name, dict(block.input)),
+                            timeout=timeout
+                        )
+                    except asyncio.TimeoutError:
+                        result = {"error": f"{block.name} 타임아웃 ({int(timeout)}초)"}
+                    except Exception as e:
+                        result = {"error": str(e)}
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -982,7 +1004,7 @@ async def get_claude_response(user_message: str) -> str:
             text_blocks = [b.text for b in response.content if b.type == "text"]
             return "\n".join(text_blocks) if text_blocks else "응답 비어있음 🤔"
     
-    return "⚠️ 도구 호출 너무 많음"
+    return "⚠️ 도구 호출 너무 많음. /reset 후 다시 시도."
 
 
 # ==================== Telegram ====================

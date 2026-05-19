@@ -12,3 +12,5 @@ python-pptx
 python-docx
 python-multipart
 telethon
+apscheduler
+pytz

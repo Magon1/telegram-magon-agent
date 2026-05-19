@@ -295,6 +295,11 @@ async def scan_telegram_messages(hours_back: int = 24) -> dict:
             if dialog.date and dialog.date < cutoff:
                 continue
             
+            entity = dialog.entity
+            username = getattr(entity, 'username', None)
+            entity_id = getattr(entity, 'id', None)
+            is_linkable = dialog.is_channel  # 슈퍼그룹/채널만 메시지 링크 가능
+            
             messages = []
             try:
                 async for msg in client.iter_messages(dialog.entity, limit=30):
@@ -312,11 +317,23 @@ async def scan_telegram_messages(hours_back: int = 24) -> dict:
                             "Unknown"
                         )
                     
+                    # 메시지별 t.me 링크 생성
+                    msg_link = None
+                    if is_linkable and msg.id:
+                        if username:
+                            msg_link = f"https://t.me/{username}/{msg.id}"
+                        elif entity_id:
+                            clean_id = abs(entity_id)
+                            if str(clean_id).startswith('100'):
+                                clean_id = int(str(clean_id)[3:])
+                            msg_link = f"https://t.me/c/{clean_id}/{msg.id}"
+                    
                     messages.append({
                         'sender': "사장님(본인)" if msg.out else sender_name,
                         'text': (msg.text or '')[:400],
                         'date': msg.date.strftime('%m-%d %H:%M'),
-                        'is_me': bool(msg.out)
+                        'is_me': bool(msg.out),
+                        'link': msg_link
                     })
             except Exception as e:
                 print(f"[telethon msg error] {dialog.name}: {e}")
@@ -330,12 +347,15 @@ async def scan_telegram_messages(hours_back: int = 24) -> dict:
                 else:
                     dialog_type = "dm"
                 
+                channel_link = f"https://t.me/{username}" if username else None
+                
                 dialogs_data.append({
                     'name': dialog.name or "Unknown",
                     'type': dialog_type,
                     'unread_count': dialog.unread_count,
                     'message_count': len(messages),
                     'messages': messages,
+                    'channel_link': channel_link
                 })
         
         return {
@@ -357,10 +377,14 @@ async def summarize_telegram_activity(hours_back: int = 24) -> dict:
     
     dialogs_summary = ""
     for d in scan_result['dialogs'][:40]:
-        dialogs_summary += f"\n\n=== {d['name']} ({d['type']}, 메시지 {d['message_count']}개, 안 읽음 {d['unread_count']}) ===\n"
+        ch_link = f" [채널링크: {d['channel_link']}]" if d.get('channel_link') else ""
+        dialogs_summary += f"\n\n=== {d['name']} ({d['type']}, 메시지 {d['message_count']}개, 안 읽음 {d['unread_count']}){ch_link} ===\n"
         for m in d['messages'][:20]:
             prefix = "[나]" if m['is_me'] else f"[{m['sender']}]"
-            dialogs_summary += f"{m['date']} {prefix}: {m['text']}\n"
+            link_part = f" [msg_link: {m['link']}]" if m.get('link') else ""
+            dialogs_summary += f"{m['date']} {prefix}: {m['text']}{link_part}\n"
+    
+    today = datetime.now().strftime('%Y.%m.%d')
     
     prompt = f"""다음은 magon님의 텔레그램 최근 {hours_back}시간 활동입니다.
 
@@ -373,34 +397,66 @@ async def summarize_telegram_activity(hours_back: int = 24) -> dict:
 
 🚨 분류 원칙 (가장 중요):
 1. "개인 DM" + "팀 그룹 대화"만 우선순위 분류 (🔴🟡🟢⚪)
-2. "정보 채널"(웹프로채팅방, 머니스택, 알파방, 코인뉴스방, 잡담방, OO크립토방, OO연구소 등 다수 사람이 모인 정보·잡담성 채널)은 **절대 우선순위 분류 X**
-   → 정보 채널은 오직 "🔥 오늘의 인사이트" 섹션에만 통합 (여러 방에서 포워딩·화제된 글 위주)
-3. "⚪ 무시 가능"은 **개인/팀 대화 중 인사·잡담만** 포함. 정보 채널은 절대 X
-4. 판단 애매하면: 사장님 이름이 직접 언급되거나, 응답 요구가 명확하면 개인/팀 대화
+2. "정보 채널"(웹프로채팅방, 머니스택, 알파방, 코인뉴스방, 잡담방, OO크립토방, OO연구소 등 다수 사람이 모인 정보·잡담성 채널)은 절대 우선순위 분류 X
+   → 정보 채널은 오직 '오늘의 인사이트' 섹션에만 통합
+3. '무시 가능'은 개인/팀 대화 중 인사·잡담만 포함. 정보 채널은 절대 X
+4. 판단 애매하면: 사장님 이름이 직접 언급되거나 응답 요구가 명확하면 개인/팀 대화
+5. 보안 위협 (API키 노출 등) 발견 시 🔴 최상단
 
-출력 형식:
-🔴 *긴급 답장 필요* — 개인/팀 대화만
-- [상대 이름 / 그룹명] 핵심 1줄 + 사장님 액션
+🚨 출력 포맷 (텔레그램 Markdown — 엄격 준수):
+- '---' 같은 구분선 절대 X
+- '#' '##' '###' 헤더 마크 절대 X
+- 섹션 제목은 *별표 양쪽*으로 볼드 처리만
+- 인사이트 근거 채널은 반드시 [채널명](msg_link) 마크다운 링크 형식 사용 (msg_link가 있는 경우만)
+- msg_link 없으면 채널명만 표시 (DM, 사적 그룹 등)
+- 액션은 명령조 한 줄 ('→ 매물 링크 확인 후 의견 전달')
 
-🟡 *답장 대기* — 개인/팀 대화만
-- [상대 / 그룹명] ...
+출력 형식 (정확히 이대로, 헤더 마크 절대 X):
 
-🟢 *정보* — 개인/팀 대화만
-- [상대 / 그룹명] ...
+📋 *텔레그램 브리핑* — {today}
 
-⚪ *무시 가능* — 개인/팀 대화 중 잡담만 (N개, 개수만)
 
-🔥 *오늘의 인사이트* — 정보 채널·알파방에서 추출
-① 제목
-   > 근거 채널 (3-5개 나열)
-   > 1-2줄 요약 + 사장님 비즈니스와의 연결점
+*🔴 긴급 답장 필요*
+
+- [상대/그룹명] 핵심 1줄
+   → 명령조 액션
+
+- [상대/그룹명] ...
+   → ...
+
+
+*🟡 답장 대기*
+
+- [상대/그룹명] 핵심 1줄
+   → 명령조 액션
+
+
+*🟢 정보*
+
+- [상대/그룹명] ...
+
+
+*⚪ 무시 가능*: N개 (개인/팀 대화 중 잡담만)
+
+
+*🔥 오늘의 인사이트*
+
+① *제목*
+   > 근거: [채널명1](msg_link1), [채널명2](msg_link2), [채널명3](msg_link3)
+   > 1-2줄 요약 + ReboundX 비즈니스 연결점
+
+② *제목*
+   > 근거: [채널명1](msg_link1), [채널명2](msg_link2)
+   > 1-2줄 요약 + 연결점
+
 
 핵심 원칙:
 - 사장님이 마지막에 답한 경우 → 액션 불필요 (🟢/⚪)
 - Backpack, Variational(Lucas), Binance(jin) 특별 케어
-- 새미(나이지리아 Growth) 성과 보고는 별도 멘션
-- 인사이트는 최소 2-3개 이상 (정보 채널이 활발하면 더)
-- 정보 채널 이름을 우선순위 섹션에 절대 넣지 말 것"""
+- 새미(나이지리아 Growth) 성과 보고 별도 멘션
+- 인사이트 최소 2-3개, 활발하면 5-6개
+- 정보 채널 이름을 우선순위 섹션에 절대 X
+- ⚪ 무시 가능은 개수만, 상세 X"""
     
     try:
         response = await claude.messages.create(
@@ -408,9 +464,8 @@ async def summarize_telegram_activity(hours_back: int = 24) -> dict:
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}]
         )
-        summary_text = response.content[0].text
         return {
-            'summary': summary_text,
+            'summary': response.content[0].text,
             'dialog_count': scan_result['dialog_count']
         }
     except Exception as e:

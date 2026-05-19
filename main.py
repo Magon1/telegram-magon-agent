@@ -389,18 +389,29 @@ async def summarize_telegram_activity(hours_back: int = 24) -> dict:
     if scan_result['dialog_count'] == 0:
         return {"summary": f"최근 {hours_back}시간 텔레그램 활동 없음"}
     
+    now_utc = datetime.now(timezone.utc)
+    
     dialogs_summary = ""
     for d in scan_result['dialogs'][:40]:
         ch_link = f" [채널링크: {d['channel_link']}]" if d.get('channel_link') else ""
-        dialogs_summary += f"\n\n=== {d['name']} ({d['type']}, 메시지 {d['message_count']}개, 안 읽음 {d['unread_count']}){ch_link} ===\n"
+        
+        # 🆕 마지막 메시지 발신자 + 경과 시간 계산
+        last_status = ""
+        if d['messages']:
+            latest = d['messages'][0]  # newest first
+            who = "✅사장님(본인)" if latest['is_me'] else f"❗{latest['sender']}"
+            last_status = f"\n[마지막 메시지 발신: {who} / 시각: {latest['date']}]"
+        
+        dialogs_summary += f"\n\n=== {d['name']} ({d['type']}, 메시지 {d['message_count']}개, 안 읽음 {d['unread_count']}){ch_link} ==={last_status}\n"
         for m in d['messages'][:20]:
             prefix = "[나]" if m['is_me'] else f"[{m['sender']}]"
             link_part = f" [msg_link: {m['link']}]" if m.get('link') else ""
             dialogs_summary += f"{m['date']} {prefix}: {m['text']}{link_part}\n"
     
-    today = datetime.now().strftime('%Y.%m.%d')
+    scan_time = datetime.now().strftime('%Y.%m.%d %H:%M')
     
     prompt = f"""다음은 magon님의 텔레그램 최근 {hours_back}시간 활동입니다.
+스캔 시각: {scan_time} KST
 
 {TEAM_CONTEXT}
 
@@ -409,30 +420,47 @@ async def summarize_telegram_activity(hours_back: int = 24) -> dict:
 [메시지 데이터]
 {dialogs_summary}
 
+🚨🚨🚨 *답장 여부 판단 - 가장 중요한 규칙*
+
+각 대화의 첫 줄에 [마지막 메시지 발신: ~ / 시각: ~] 표기를 반드시 확인하세요.
+이게 우선순위 분류의 핵심 신호입니다.
+
+**판단 절차:**
+1. 마지막 발신이 "✅사장님(본인)"인 경우 → 사장님이 이미 답장 완료
+   - 🔴 긴급 답장 필요에 절대 넣지 말 것
+   - 🟡 답장 대기에 절대 넣지 말 것
+   - 정보 가치 있으면 🟢, 잡담이면 ⚪
+   - (상대방 답을 기다리는 경우라면 🟢에 "[상대 답 대기 중]" 표시)
+
+2. 마지막 발신이 "❗{{상대방}}"인 경우 → 사장님이 아직 답장 안 함
+   - 응답 요구 명확 + 24시간 이상 경과 → 🔴
+   - 응답 요구 있지만 시간 여유 → 🟡
+   - 단순 정보·통보 (질문 없음) → 🟢
+   - 인사·잡담 → ⚪
+
 🚨 분류 원칙:
-1. "개인 DM" + "팀 그룹 대화"만 우선순위 분류 (🔴🟡🟢⚪)
-2. "정보 채널"(웹프로채팅방, 머니스택, 알파방, 코인뉴스방, 잡담방, OO크립토방, OO연구소 등)은 우선순위 분류 X → '오늘의 인사이트'에만
-3. '무시 가능'은 개인/팀 대화 중 인사·잡담만 (정보 채널 절대 X)
-4. 사장님이 마지막 답한 경우 → 액션 불필요
-5. 보안 위협 (API키 노출 등) 🔴 최상단
+1. "개인 DM" + "팀 그룹 대화"만 우선순위 분류
+2. "정보 채널"(웹프로채팅방, 머니스택, 알파방, 코인뉴스방, OO크립토방, OO연구소 등 다수 사람 모인 정보·잡담성)은 우선순위 분류 X → '오늘의 인사이트'에만 통합
+3. ⚪ 무시 가능은 개인/팀 대화 중 잡담만 (정보 채널 절대 X)
+4. 보안 위협 (API키 노출 등) 🔴 최상단
 
 🚨 출력 포맷 (텔레그램 Markdown — 엄격):
 - '---' '#' '##' '###' 헤더 마크 절대 X
 - 섹션 제목은 *별표 양쪽* 볼드만
-- 인사이트 근거 채널은 [채널명](msg_link) 마크다운 링크 (msg_link 있는 경우만)
+- 인사이트 근거 채널은 [채널명](msg_link) 마크다운 링크 형식
 
-출력 형식 (정확히 이대로):
+출력 형식 (정확히):
 
-📋 *텔레그램 동향* — {today}
+📋 *텔레그램 동향* — {scan_time}
 
 
-*🔴 긴급 답장 필요*
+*🔴 긴급 답장 필요* (마지막 발신이 상대방이고 답장 시급한 경우만)
 
 - [상대/그룹명] 핵심 1줄
    → 명령조 액션
 
 
-*🟡 답장 대기*
+*🟡 답장 대기* (마지막 발신이 상대방이고 답장 필요한 경우)
 
 - [상대/그룹명] 핵심 1줄
    → 명령조 액션
@@ -440,7 +468,7 @@ async def summarize_telegram_activity(hours_back: int = 24) -> dict:
 
 *🟢 정보*
 
-- [상대/그룹명] ...
+- [상대/그룹명] 핵심
 
 
 *⚪ 무시 가능*: N개
@@ -457,10 +485,11 @@ async def summarize_telegram_activity(hours_back: int = 24) -> dict:
    > 요약 + 연결점
 
 
-핵심:
+최종 검토:
+- 🔴/🟡에 넣기 전 다시 확인: [마지막 메시지 발신: ✅사장님] 이면 빼야 함
 - Backpack, Variational(Lucas), Binance(jin) 특별 케어
 - 새미 성과 보고 별도 멘션
-- 인사이트 최소 2-3개, 활발하면 5-6개"""
+- 인사이트 최소 2-3개"""
     
     try:
         response = await claude.messages.create(
